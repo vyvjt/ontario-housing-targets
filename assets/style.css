@@ -1,0 +1,13 @@
+body { font-family: "Source Sans Pro", "Segoe UI", Helvetica, Arial, sans-serif; line-height: 1.6; font-size: 16px; }
+.main-container { max-width: 980px; }
+h1.title { font-weight: 700; margin-bottom: 0.1em; }
+h3.subtitle { color: #4a5a6a; font-weight: 400; margin-top: 0; }
+.author, .date { color: #6b7785; }
+h1, h2 { margin-top: 1.6em; }
+table { margin: 1em auto 0.4em auto !important; font-size: 14px; }
+caption { caption-side: top; color: #2c3e50; font-weight: 600; text-align: left; padding-bottom: 6px; }
+.box { border-left: 5px solid #2c7fb8; background: #f2f7fb; padding: 0.8em 1.2em; margin: 1.2em 0; border-radius: 3px; }
+.box.warn { border-left-color: #E69F00; background: #fff8ec; }
+.box p:last-child, .box ul:last-child { margin-bottom: 0; }
+.caption-note { font-size: 13.5px; color: #55606b; margin-top: -0.2em; }
+pre { font-size: 12.5px; }
