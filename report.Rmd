@@ -1,0 +1,619 @@
+---
+title: "Are Ontario's Municipalities Meeting Their Housing Targets?"
+subtitle: "An inferential analysis of provincial housing-supply progress, 2023–2024"
+author: "Your Name"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: flatly
+    highlight: tango
+    toc: true
+    toc_depth: 2
+    toc_float: true
+    number_sections: true
+    self_contained: true
+    css: assets/style.css
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE, message = FALSE, warning = FALSE,
+  fig.path = "figures/", fig.align = "center",
+  fig.width = 7.5, fig.height = 4.3, dpi = 150, out.width = "100%"
+)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(scales)
+library(knitr)
+library(boot)
+
+source("R/load_data.R")
+
+set.seed(57)                       # every random step below is reproducible
+B_BOOT <- 10000                    # bootstrap resamples
+CV_K   <- 5                        # folds
+CV_REP <- 50                       # CV repetitions
+
+theme_set(
+  theme_minimal(base_size = 12) +
+    theme(plot.title = element_text(face = "bold"),
+          plot.title.position = "plot",
+          panel.grid.minor = element_blank(),
+          legend.position = "bottom")
+)
+status_cols <- c("Not met" = "#C0392B", "On track" = "#E69F00", "Exceeded" = "#1B9E77")
+
+f1 <- function(x) formatC(x, format = "f", digits = 1, big.mark = ",")
+f0 <- function(x) formatC(x, format = "f", digits = 0, big.mark = ",")
+fp <- function(p) ifelse(p < 0.001, "< 0.001", sprintf("%.3f", p))
+pf <- function(p) ifelse(p < 0.001, "p < 0.001", paste0("p = ", sprintf("%.3f", p)))   # "p = 0.072" / "p < 0.001"
+ci_txt <- function(lo, hi, d = 1) sprintf(paste0("[%.", d, "f, %.", d, "f]"), lo, hi)
+```
+
+```{r data, include=FALSE}
+long <- load_housing(use_online = FALSE)   # bundled copies of the official CSVs
+wide <- make_wide(long)                    # 50 municipalities, both years side by side
+tidy <- long |>
+  filter(!is_aggregate) |>
+  left_join(select(wide, municipality, size_class), by = "municipality") |>
+  mutate(status = factor(status, levels = names(status_cols)),
+         year_f = factor(year))
+```
+
+```{r analysis, include=FALSE}
+## ---------- 0. data-quality checks -------------------------------------------
+status_rule <- function(p) cut(p, c(-Inf, 80, 100, Inf),
+                               labels = names(status_cols), right = FALSE)
+checks <- tibble(
+  Check = c("Published % equals units ÷ annual target (±0.05 pp)",
+            "Published status follows the 80% / 100% rule",
+            "Cumulative 2024 − 2024 units = cumulative 2023 (all 50)",
+            "Municipality names unique after trimming whitespace"),
+  Result = c(
+    all(abs(long$annual_units / long$annual_target * 100 - long$progress_pct) < 0.05),
+    all(as.character(status_rule(tidy$progress_pct)) == as.character(tidy$status)),
+    all(wide$cum_progress_since_2022_2024 - wide$annual_units_2024 ==
+          wide$cum_progress_since_2022_2023),
+    !any(duplicated(wide$municipality))
+  )
+) |> mutate(Result = ifelse(Result, "Pass", "FAIL"))
+
+## ---------- 1. province-level totals -----------------------------------------
+prov <- long |>
+  group_by(year) |>
+  summarise(
+    units_50  = sum(annual_units[!is_aggregate]),
+    target_50 = sum(annual_target[!is_aggregate]),
+    units_all = sum(annual_units),
+    target_all = sum(annual_target),
+    .groups = "drop"
+  ) |>
+  mutate(pct_50 = 100 * units_50 / target_50, pct_all = 100 * units_all / target_all)
+p23 <- prov |> filter(year == 2023)
+p24 <- prov |> filter(year == 2024)
+
+## ---------- 2. descriptive statistics -----------------------------------------
+status_tab <- tidy |>
+  count(year, status) |>
+  group_by(year) |>
+  mutate(share = 100 * n / sum(n)) |>
+  ungroup()
+n_status <- function(y, s) status_tab$n[status_tab$year == y & status_tab$status == s]
+
+desc_tab <- tidy |>
+  group_by(Year = year) |>
+  summarise(n = n(), Mean = mean(progress_pct), Median = median(progress_pct),
+            SD = sd(progress_pct), IQR = IQR(progress_pct),
+            Min = min(progress_pct), Max = max(progress_pct),
+            `Share ≥ 100%` = 100 * mean(progress_pct >= 100), .groups = "drop")
+d23 <- desc_tab |> filter(Year == 2023)
+d24 <- desc_tab |> filter(Year == 2024)
+
+top_bottom <- function(y) {
+  x <- tidy |> filter(year == y) |> arrange(desc(progress_pct))
+  lab <- function(d) sprintf("%s (%.1f%%)", d$municipality, d$progress_pct)
+  tibble(Rank = 1:5, high = lab(head(x, 5)), low = lab(head(arrange(x, progress_pct), 5)))
+}
+tb <- bind_cols(top_bottom(2023), select(top_bottom(2024), high24 = high, low24 = low))
+names(tb) <- c("Rank", "2023 – highest", "2023 – lowest", "2024 – highest", "2024 – lowest")
+
+size_tab <- tidy |>
+  group_by(`Size class` = size_class, Year = year) |>
+  summarise(n = n(), Mean = mean(progress_pct), Median = median(progress_pct), .groups = "drop") |>
+  pivot_wider(names_from = Year, values_from = c(Mean, Median), names_glue = "{.value} {Year}") |>
+  select(`Size class`, n, `Mean 2023`, `Median 2023`, `Mean 2024`, `Median 2024`)
+
+transition <- table(`2023 status` = wide$status_2023, `2024 status` = wide$status_2024)
+stay <- sum(diag(transition))
+
+## ---------- 3. inference on the mean attainment --------------------------------
+infer_mean <- function(x, yr) {
+  tt  <- t.test(x, mu = 100)
+  wt  <- suppressWarnings(wilcox.test(x, mu = 100, exact = FALSE))
+  bm  <- boot(x, function(d, i) mean(d[i]), R = B_BOOT)
+  bmd <- boot(x, function(d, i) median(d[i]), R = B_BOOT)
+  bci <- boot.ci(bm,  type = "bca")$bca[4:5]
+  mci <- boot.ci(bmd, type = "perc")$percent[4:5]
+  tibble(Year = yr, Mean = mean(x), Median = median(x),
+         `t-interval (95%)` = ci_txt(tt$conf.int[1], tt$conf.int[2]),
+         `Bootstrap BCa (95%)` = ci_txt(bci[1], bci[2]),
+         `Bootstrap median (95%)` = ci_txt(mci[1], mci[2]),
+         `t-test p` = tt$p.value, `Wilcoxon p` = wt$p.value,
+         t_lo = tt$conf.int[1], t_hi = tt$conf.int[2], b_lo = bci[1], b_hi = bci[2])
+}
+inf_tab <- bind_rows(infer_mean(wide$progress_pct_2023, 2023),
+                     infer_mean(wide$progress_pct_2024, 2024))
+i23 <- inf_tab |> filter(Year == 2023); i24 <- inf_tab |> filter(Year == 2024)
+
+## paired comparison: 2023 vs 2024 (two-sided, decided before looking at the data)
+wide <- wide |> mutate(delta = progress_pct_2023 - progress_pct_2024)
+pt   <- t.test(wide$progress_pct_2023, wide$progress_pct_2024, paired = TRUE)
+pw   <- suppressWarnings(wilcox.test(wide$progress_pct_2023, wide$progress_pct_2024,
+                                     paired = TRUE, exact = FALSE))
+bd   <- boot(wide$delta, function(d, i) mean(d[i]), R = B_BOOT)
+bci_all <- boot.ci(bd, type = c("bca", "perc"))
+bdci  <- bci_all$bca[4:5]
+bpci  <- bci_all$percent[4:5]
+dz   <- mean(wide$delta) / sd(wide$delta)
+n_down <- sum(wide$delta > 0)
+units_change  <- 100 * (p24$units_50  / p23$units_50  - 1)
+target_change <- 100 * (p24$target_50 / p23$target_50 - 1)
+
+## ---------- 4. regression ------------------------------------------------------
+fit_year <- function(yr) {
+  d <- tidy |> filter(year == yr) |>
+    transmute(municipality, target = annual_target, units = annual_units, y = progress_pct)
+  list(data = d,
+       lin    = lm(y ~ target, d),
+       semi   = lm(y ~ log(target), d),
+       loglog = lm(log(y) ~ log(target), d))
+}
+fits <- list(`2023` = fit_year(2023), `2024` = fit_year(2024))
+
+mod_row <- function(m, label, yr) {
+  s <- summary(m)
+  tibble(Year = yr, Model = label,
+         Slope = format(signif(coef(m)[2], 3), scientific = FALSE),
+         `p-value` = fp(s$coefficients[2, 4]),
+         `R²` = s$r.squared, `Adj. R²` = s$adj.r.squared,
+         `Shapiro-Wilk p (residuals)` = fp(shapiro.test(resid(m))$p.value))
+}
+model_cmp <- bind_rows(lapply(c("2023", "2024"), function(y) {
+  f <- fits[[y]]
+  bind_rows(mod_row(f$lin,    "A. % ~ target (linear)",           y),
+            mod_row(f$semi,   "B. % ~ log(target) (semi-log)",    y),
+            mod_row(f$loglog, "C. log(%) ~ log(target) (log-log)", y))
+}))
+
+cook <- cooks.distance(fits[["2023"]]$semi)
+top_cook <- names(which.max(cook))
+top_cook_name <- fits[["2023"]]$data$municipality[as.integer(top_cook)]
+top_cook_val  <- max(cook)
+
+slope_boot <- function(d) {
+  b <- boot(d, function(dd, i) coef(lm(log(y) ~ log(target), dd[i, ]))[2], R = 5000)
+  boot.ci(b, type = "perc")$percent[4:5]
+}
+loglog_tab <- bind_rows(lapply(c("2023", "2024"), function(y) {
+  f <- fits[[y]]; m <- f$loglog; s <- summary(m)
+  ci <- confint(m)[2, ]; bci <- slope_boot(f$data)
+  nk <- f$data |> filter(municipality != "Chatham-Kent")
+  m_nk <- lm(log(y) ~ log(target), nk)
+  nt <- f$data |> filter(municipality != "Toronto")
+  m_nt <- lm(log(y) ~ log(target), nt)
+  tibble(Year = y,
+         `Slope (elasticity)` = coef(m)[2],
+         `95% CI` = ci_txt(ci[1], ci[2], 3),
+         `Bootstrap 95% CI` = ci_txt(bci[1], bci[2], 3),
+         `p-value` = fp(s$coefficients[2, 4]),
+         `R²` = s$r.squared,
+         `Doubling the target →` = sprintf("%+.1f%% attainment", 100 * (2^coef(m)[2] - 1)),
+         `Slope excl. Chatham-Kent` = coef(m_nk)[2],
+         p_nk = summary(m_nk)$coefficients[2, 4],
+         `Slope excl. Toronto` = coef(m_nt)[2],
+         p_nt = summary(m_nt)$coefficients[2, 4],
+         `Units scale as target^` = coef(m)[2] + 1,
+         lo = ci[1], hi = ci[2])
+}))
+l23 <- loglog_tab |> filter(Year == "2023"); l24 <- loglog_tab |> filter(Year == "2024")
+m23 <- summary(fits[["2023"]]$loglog)
+
+semi_noCK <- lm(y ~ log(target), filter(fits[["2023"]]$data, municipality != "Chatham-Kent"))
+
+## ---------- 5. cross-validation -------------------------------------------------
+cv_models <- list(
+  "Intercept only (mean)"   = function(tr) { m <- mean(tr$y);            function(nd) rep(m, nrow(nd)) },
+  "A. Linear: target"       = function(tr) { m <- lm(y ~ target, tr);    function(nd) predict(m, nd) },
+  "B. Semi-log: log(target)"= function(tr) { m <- lm(y ~ log(target), tr); function(nd) predict(m, nd) },
+  "C. Log-log"              = function(tr) {
+    m <- lm(log(y) ~ log(target), tr); smear <- mean(exp(resid(m)))   # Duan smearing
+    function(nd) exp(predict(m, nd)) * smear }
+)
+d_cv <- fits[["2023"]]$data
+cv_raw <- bind_rows(lapply(seq_len(CV_REP), function(r) {
+  fold <- sample(rep(seq_len(CV_K), length.out = nrow(d_cv)))      # equal-sized folds
+  bind_rows(lapply(names(cv_models), function(nm) {
+    pred <- numeric(nrow(d_cv))
+    for (k in seq_len(CV_K)) {
+      pred[fold == k] <- cv_models[[nm]](d_cv[fold != k, ])(d_cv[fold == k, ])
+    }
+    tibble(rep = r, Model = nm, RMSE = sqrt(mean((d_cv$y - pred)^2)), MAE = mean(abs(d_cv$y - pred)))
+  }))
+}))
+cv_tab <- cv_raw |>
+  group_by(Model) |>
+  summarise(`RMSE (mean)` = mean(RMSE), `RMSE (SD over repeats)` = sd(RMSE),
+            `MAE (mean)` = mean(MAE), .groups = "drop") |>
+  mutate(Model = factor(Model, levels = names(cv_models))) |>
+  arrange(Model)
+base_rmse <- cv_tab$`RMSE (mean)`[1]
+base_mae  <- cv_tab$`MAE (mean)`[1]
+cv_tab <- cv_tab |>
+  mutate(`RMSE vs. baseline` = sprintf("%+.1f%%", 100 * (`RMSE (mean)` / base_rmse - 1)),
+         `MAE vs. baseline`  = sprintf("%+.1f%%", 100 * (`MAE (mean)`  / base_mae  - 1)))
+
+d24_new <- fits[["2024"]]$data   # temporal hold-out: fit on 2023, predict 2024
+oot <- bind_rows(lapply(names(cv_models), function(nm) {
+  p <- cv_models[[nm]](d_cv)(d24_new)
+  tibble(Model = nm, `RMSE (2024 hold-out)` = sqrt(mean((d24_new$y - p)^2)),
+         `MAE (2024 hold-out)` = mean(abs(d24_new$y - p)))
+}))
+cv_tab <- left_join(cv_tab, oot, by = "Model")
+cv_C <- cv_tab |> filter(grepl("^C", Model)); cv_A <- cv_tab |> filter(grepl("^A", Model))
+cv_0 <- cv_tab |> filter(grepl("^Intercept", Model))
+```
+
+<div class="box">
+
+**Key findings**
+
+1. **Most municipalities are falling short, and 2024 was weaker than 2023.** Only `r n_status(2023, "Exceeded")` of 50 municipalities exceeded their annual target in 2023 and `r n_status(2024, "Exceeded")` in 2024; `r n_status(2023, "Not met")` and `r n_status(2024, "Not met")` respectively were below 80% ("Not met"). The 50 targeted municipalities together reached `r f1(p23$pct_50)`% of their combined target in 2023 and `r f1(p24$pct_50)`% in 2024.
+2. **The *average* municipality is statistically indistinguishable from 100%.** Mean attainment was `r f1(d23$Mean)`% (2023; 95% CI `r i23$"t-interval (95%)"`) and `r f1(d24$Mean)`% (2024; 95% CI `r i24$"t-interval (95%)"`). Both intervals contain 100% (`r pf(i23$"t-test p")` and `r fp(i24$"t-test p")`), and bootstrap intervals agree. The unweighted mean is pulled up by a few small municipalities (median: `r f1(d23$Median)`% and `r f1(d24$Median)`%).
+3. **The 2023→2024 drop (`r f1(pt$estimate)` percentage points on average) is borderline.** The paired t-test (`r pf(pt$p.value)`) and Wilcoxon test (`r pf(pw$p.value)`) do not reach the 5% level, while a bootstrap interval for the mean change, `r ci_txt(bdci[1], bdci[2])`, only just excludes zero. Province-wide, units fell `r f1(abs(units_change))`% while annual targets rose `r f1(target_change)`%, so the lower attainment reflects both forces.
+4. **Bigger targets are associated with lower attainment.** In a log-log regression, doubling a municipality's annual target is associated with about `r sprintf("%.0f", abs(100 * (2^l23$"Slope (elasticity)" - 1)))`% *lower* attainment in 2023 (slope `r sprintf("%.3f", l23$"Slope (elasticity)")`, 95% CI `r l23$"95% CI"`, p = `r l23$"p-value"`), and the pattern repeats in 2024. The result survives dropping either Toronto or Chatham-Kent (the most extreme observations) and is confirmed by bootstrap.
+5. **Cross-validation confirms the relationship is real but modest.** Repeated 5-fold CV shows the log-log model cutting out-of-sample RMSE by about `r f1(abs(100 * (cv_C$"RMSE (mean)" / base_rmse - 1)))`% relative to predicting the average, whereas the raw linear model is *worse* than the baseline in repeated CV.
+
+</div>
+
+# Background and research questions
+
+## Policy context
+
+Ontario has a goal of building at least **1.5 million homes by 2031**, backed by measures such as the *More Homes Built Faster Act, 2022*. To pursue it, the province assigned a ten-year housing target (2022–2031) to each of its **50 largest and fastest-growing municipalities**, based on current population and 2011–2021 growth trends. Each ten-year target is broken into annual calendar-year targets that ramp up until 2026. Toronto, for example, carries the largest target: 285,000 homes.
+
+## Who collected the data, and how
+
+The data come from the Ontario Data Catalogue dataset *Ontario's housing supply progress*, published under the Open Government Licence – Ontario by the provincial **Ministry of Municipal Affairs and Housing** (the dataset is maintained by its Planning Policy Branch and updated monthly). It counts how many new homes were **started** toward each municipal target in a calendar year. For 2023 this includes housing starts, additional residential units (e.g. secondary suites) and long-term-care beds; from 2024 it also includes postsecondary student beds and licensed congregate retirement-home suites. The published figures reflect the ministry's post-review adjustments and may differ from CMHC's Starts and Completions Survey. I use the two annual files (January–December 2023 and 2024) as last updated in December 2025.
+
+Three features matter for interpretation:
+
+* The unit counted is a housing **start**, not a completion, so "progress" below means *attainment of the annual start target*.
+* The 2024 count has a broader definition than 2023 (student beds, retirement suites), so year-over-year comparisons are only approximately like-for-like.
+* Annual targets rise over time, so a lower attainment *percentage* can reflect higher targets and not only fewer homes.
+
+## Research questions
+
+1. **Are municipalities meeting their annual housing targets?** (How many exceed, are on track, or fall short, in each year?)
+2. **What is the average attainment rate, and is it different from the 100% goal?** Did it change between 2023 and 2024?
+3. **Is the size of a municipality's target related to how much of it is achieved?**
+
+# Data
+
+## Variables
+
+After cleaning, the analysis uses one row per municipality (n = 50) with the variables below. The attainment rate is the official "Progress %": units started in the year divided by the annual target, times 100, so 100% means the target was exactly met.
+
+```{r dictionary}
+dict <- tibble(
+  Variable = c("municipality", "ten_year_target", "annual_target_YYYY", "annual_units_YYYY",
+               "progress_pct_YYYY", "status_YYYY", "size_class"),
+  Type = c("text", "integer", "integer", "integer", "numeric", "factor", "factor (derived)"),
+  Range = c("50 municipalities",
+            sprintf("%s – %s", f0(min(wide$ten_year_target)), f0(max(wide$ten_year_target))),
+            sprintf("%s – %s", f0(min(c(wide$annual_target_2023, wide$annual_target_2024))),
+                    f0(max(c(wide$annual_target_2023, wide$annual_target_2024)))),
+            sprintf("%s – %s", f0(min(c(wide$annual_units_2023, wide$annual_units_2024))),
+                    f0(max(c(wide$annual_units_2023, wide$annual_units_2024)))),
+            sprintf("%.1f – %.1f", min(tidy$progress_pct), max(tidy$progress_pct)),
+            "Not met / On track / Exceeded", "4 levels"),
+  Description = c("Municipality name",
+                  "Homes required by 2031 (2022–2031), province-assigned",
+                  "Province-assigned target for calendar year YYYY (2023 or 2024)",
+                  "New homes started in year YYYY",
+                  "Attainment rate: 100 × units ÷ annual target (stored as text with a % sign in the raw file)",
+                  "Not met (< 80%), On track (80% to < 100%), Exceeded (≥ 100%)",
+                  "Ten-year target: Small < 5k, Medium 5–20k, Large 20–60k, Major ≥ 60k")
+)
+kable(dict, caption = "Table 1. Data dictionary (cleaned data).")
+```
+
+## Cleaning and validation
+
+The raw files each contain 51 rows. Three issues were handled explicitly:
+
+* **Aggregate row removed.** The last row, *Municipalities without targets*, is the combined total of all other Ontario municipalities, not a municipality. Treating it as a 51st observation would distort every mean, test and model, so it is excluded from all municipal-level analysis (it is used only for the province-wide totals in Section 3.1).
+* **Whitespace.** The 2024 file spells one name `"Woodstock "` with a trailing space; left alone, joining the two years silently drops that municipality. Names are trimmed before merging.
+* **Text to numbers.** Percentages stored as text (`"89.90%"`) are parsed to numeric.
+
+```{r checks}
+kable(checks, caption = "Table 2. Automated data-quality checks.")
+```
+
+# Descriptive analysis
+
+## Are targets being met?
+
+```{r prov-table}
+prov_tab <- tibble(
+  Year = prov$year,
+  `Units started (50 targeted municipalities)` = f0(prov$units_50),
+  `Annual targets (50)` = f0(prov$target_50),
+  `Attainment (50)` = sprintf("%.1f%%", prov$pct_50),
+  `Attainment, all Ontario municipalities` = sprintf("%.1f%%", prov$pct_all)
+)
+kable(prov_tab, align = "lrrrr",
+      caption = "Table 3. Aggregate attainment: total units started ÷ total annual targets.")
+```
+
+Taken together, the 50 targeted municipalities achieved `r f1(p23$pct_50)`% of their combined 2023 target but only `r f1(p24$pct_50)`% in 2024. Counting every Ontario municipality (including those without targets) gives `r f1(p23$pct_all)`% and `r f1(p24$pct_all)`%. Total units started fell by `r f1(abs(units_change))`% while the summed annual targets rose by `r f1(target_change)`%, so both forces pushed the 2024 attainment down.
+
+```{r status-bar, fig.height=4}
+ggplot(status_tab, aes(factor(year), n, fill = status)) +
+  geom_col(width = 0.55, colour = "white") +
+  geom_text(aes(label = n), position = position_stack(vjust = 0.5),
+            colour = "white", fontface = "bold", size = 4.2) +
+  scale_fill_manual(values = status_cols, name = "Status") +
+  labs(title = "Figure 1. Housing target status, 2023 vs 2024",
+       subtitle = "Number of the 50 targeted municipalities in each category",
+       x = NULL, y = "Number of municipalities")
+```
+
+The share of municipalities that fell short (< 80% of target) rose from `r f0(100 * n_status(2023, "Not met") / 50)`% (`r n_status(2023, "Not met")` of 50) in 2023 to `r f0(100 * n_status(2024, "Not met") / 50)`% (`r n_status(2024, "Not met")`) in 2024, while the number exceeding their target fell from `r n_status(2023, "Exceeded")` to `r n_status(2024, "Exceeded")`.
+
+```{r transition}
+tr_df <- as.data.frame.matrix(transition)
+tr_df <- cbind(`2023 status ↓ / 2024 status →` = rownames(tr_df), tr_df)
+rownames(tr_df) <- NULL
+kable(tr_df, caption = "Table 4. Status transition matrix: how each municipality's status changed (n = 50).")
+```
+
+`r stay` of the 50 municipalities kept the same status. The most common move was from *Exceeded* to *Not met* (`r transition["Exceeded", "Not met"]` municipalities), compared with only `r transition["Not met", "Exceeded"]` moving the other way, so performance was far from stable at the individual level. Strong results one year did not predict strong results the next.
+
+## Distribution of attainment
+
+```{r hist, fig.height=5.4}
+ggplot(tidy, aes(progress_pct)) +
+  geom_histogram(binwidth = 50, boundary = 0, fill = "#3C78A8", colour = "white") +
+  geom_vline(xintercept = 100, colour = "#C0392B", linetype = "dashed", linewidth = 0.8) +
+  facet_wrap(~ year, ncol = 1) +
+  labs(title = "Figure 2. Distribution of attainment rates",
+       subtitle = "Dashed red line = 100% of the annual target",
+       x = "Housing progress (% of annual target)", y = "Number of municipalities")
+```
+
+Both distributions are strongly **right-skewed**: most municipalities cluster between roughly 25% and 150% of target, with a thin tail of high performers (Chatham-Kent at `r f1(max(tidy$progress_pct[tidy$year == 2023]))`% in 2023; North Bay at `r f1(max(tidy$progress_pct[tidy$year == 2024]))`% in 2024). In 2023 the tallest bar sits just below the 100% line; in 2024 the mass shifts left.
+
+```{r top-bottom}
+kable(tb, caption = "Table 5. The five highest and five lowest attainment rates in each year.", align = "clllll")
+```
+
+The highest rates mostly belong to municipalities with very small targets (Chatham-Kent, Sarnia, North Bay and Belleville each have ten-year targets of about 1,000–3,100 homes), where a few hundred extra homes translate into a very large percentage. At the other end, the largest targets do not produce the highest rates: Mississauga (ten-year target 120,000) reached only `r f1(wide$progress_pct_2023[wide$municipality == "Mississauga"])`% of its target in 2023 and `r f1(wide$progress_pct_2024[wide$municipality == "Mississauga"])`% in 2024.
+
+## Summary statistics
+
+```{r desc-table}
+kable(desc_tab, digits = 1, caption = "Table 6. Summary statistics of attainment rate (%), by year.")
+```
+
+**Reading Table 6.** In both years the **mean exceeds the median** (`r f1(d23$Mean)` vs `r f1(d23$Median)` in 2023; `r f1(d24$Mean)` vs `r f1(d24$Median)` in 2024), which is the numerical signature of right skew: a handful of extreme values drag the mean upward, so the median describes the *typical* municipality better. The typical municipality reached only about `r f0(d23$Median)`% of its target in 2023 and `r f0(d24$Median)`% in 2024, i.e. it fell short both years. The spread is large relative to the centre (SD `r f1(d23$SD)` and `r f1(d24$SD)`), and the full range runs from `r f1(d24$Min)`% to `r f1(d23$Max)`%. Between years, the mean dropped by `r f1(d23$Mean - d24$Mean)` points, the median by `r f1(d23$Median - d24$Median)`, and the share of municipalities at or above 100% fell from `r f0(d23$"Share ≥ 100%")`% to `r f0(d24$"Share ≥ 100%")`%, a consistent downward shift. Spread also narrowed (SD down by `r f1(d23$SD - d24$SD)`), largely because the 2023 maximum was more extreme than any 2024 value.
+
+```{r boxplot, fig.height=4.6}
+ggplot(tidy, aes(year_f, progress_pct)) +
+  geom_boxplot(aes(fill = year_f), width = 0.45, alpha = 0.55, outlier.shape = NA, show.legend = FALSE) +
+  geom_jitter(width = 0.1, alpha = 0.55, size = 1.8, colour = "grey25") +
+  geom_hline(yintercept = 100, colour = "#C0392B", linetype = "dashed") +
+  scale_fill_manual(values = c("2023" = "#3C78A8", "2024" = "#E69F00")) +
+  labs(title = "Figure 3. Attainment rate by year",
+       subtitle = "Boxes show median and quartiles; dots are individual municipalities; red line = 100%",
+       x = NULL, y = "Housing progress (% of annual target)")
+```
+
+**Reading Figure 3.** Both boxes sit *below* the 100% line at the median, with the 2024 box shifted down and compressed relative to 2023. Both have long upper whiskers and several outliers above the whiskers (the extreme points identified in Table 5), confirming the right skew seen in the histograms. The two distributions overlap heavily: most of the 2024 box lies within the range of the 2023 box, a first hint that the year-to-year shift is modest compared with the variation *between* municipalities, which the formal comparison in Section 4.2 tests.
+
+## Attainment by municipality size
+
+```{r size-plot, fig.height=4.6}
+ggplot(tidy, aes(size_class, progress_pct)) +
+  geom_boxplot(fill = "#3C78A8", alpha = 0.35, outlier.shape = NA, width = 0.55) +
+  geom_jitter(width = 0.12, alpha = 0.6, size = 1.7, colour = "grey25") +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 3.2, fill = "white", colour = "black") +
+  geom_hline(yintercept = 100, colour = "#C0392B", linetype = "dashed") +
+  facet_wrap(~ year) +
+  scale_x_discrete(guide = guide_axis(n.dodge = 2)) +
+  labs(title = "Figure 4. Attainment rate by size of ten-year target",
+       subtitle = "Diamonds = group mean; red line = 100% of annual target",
+       x = "Municipality size (ten-year housing target)", y = "Housing progress (% of annual target)")
+```
+
+```{r size-table}
+kable(size_tab, digits = 1, caption = "Table 7. Attainment rate (%) by municipality size class.")
+```
+
+Small municipalities (ten-year target under 5,000) are the only group that clearly exceeds 100% (mean `r f0(size_tab$"Mean 2023"[1])`%, median `r f0(size_tab$"Median 2023"[1])`% in 2023), while medium, large and major municipalities cluster below it (medians of roughly 54–89%). This size gradient motivates the regression in Section 5.
+
+# Statistical inference
+
+## Is mean attainment different from 100%?
+
+Let μ be the true mean attainment rate across Ontario's targeted municipalities. For each year I test **H₀: μ = 100%** against **H₁: μ ≠ 100%** at α = 0.05, and report a 95% confidence interval for μ three ways: the classical *t*-interval, a **bootstrap BCa interval** (`r f0(B_BOOT)` resamples of the 50 municipalities), and, as a check that is robust to skew and outliers, a bootstrap interval for the **median** and a Wilcoxon signed-rank test.
+
+```{r inference-table}
+kable(select(inf_tab, Year, Mean, Median, `t-interval (95%)`, `Bootstrap BCa (95%)`,
+             `Bootstrap median (95%)`, `t-test p`, `Wilcoxon p`),
+      digits = c(0, 1, 1, 0, 0, 0, 3, 3),
+      caption = "Table 8. Mean attainment: confidence intervals and tests against 100%.")
+```
+
+```{r ci-plot, fig.height=3}
+ci_df <- inf_tab |>
+  transmute(Year = factor(Year), Mean, t_lo, t_hi, b_lo, b_hi) |>
+  pivot_longer(c(t_lo, t_hi, b_lo, b_hi), names_to = c("Method", ".value"),
+               names_pattern = "(.)_(.*)") |>
+  mutate(Method = ifelse(Method == "t", "t-interval", "Bootstrap BCa"))
+ggplot(ci_df, aes(Mean, Year, colour = Method)) +
+  geom_vline(xintercept = 100, colour = "#C0392B", linetype = "dashed") +
+  geom_pointrange(aes(xmin = lo, xmax = hi), position = position_dodge(width = 0.5), linewidth = 0.8) +
+  scale_colour_manual(values = c("t-interval" = "#3C78A8", "Bootstrap BCa" = "#E69F00"), name = NULL) +
+  labs(title = "Figure 5. 95% confidence intervals for mean attainment",
+       subtitle = "Dashed line = 100% (target met on average)", x = "Mean attainment (%)", y = NULL)
+```
+
+**Interpretation.** In 2023 the sample mean is `r f1(i23$Mean)`% with a 95% *t*-interval of `r i23$"t-interval (95%)"`; in 2024 it is `r f1(i24$Mean)`% (`r i24$"t-interval (95%)"`). Both intervals contain 100%, and the tests agree (*t*-test `r pf(i23$"t-test p")` and `r fp(i24$"t-test p")`), so **we cannot reject H₀ in either year**: the data do not show that the average municipality systematically over- or under-shoots its target. The bootstrap BCa intervals (`r i23$"Bootstrap BCa (95%)"` and `r i24$"Bootstrap BCa (95%)"`) are shifted to the right of the *t*-intervals, which reflects the right skew, but they too contain 100%, so the conclusion does not hinge on normality. The *typical* municipality tells a somewhat different story: the Wilcoxon test gives `r pf(i23$"Wilcoxon p")` for 2023 and `r pf(i24$"Wilcoxon p")` for 2024, and the bootstrap interval for the 2024 median, `r i24$"Bootstrap median (95%)"`, lies entirely below 100%. In 2024 the *median* municipality, unlike the mean, did fall short of its target.
+
+> **Two ways to "average".** The unweighted mean of municipal rates (`r f1(d23$Mean)`% in 2023) is higher than the aggregate rate (`r f1(p23$pct_50)`%). The mean gives a small town the same weight as Toronto, and small towns have the largest percentages; the aggregate weights by target size. Both answers are valid but answer different questions: *"how does the typical municipality do?"* versus *"how many of the province's targeted homes were started?"*
+
+## Did attainment change between 2023 and 2024?
+
+Because the same 50 municipalities appear in both years, I use a **paired** comparison on the difference Δ = attainment₂₀₂₃ − attainment₂₀₂₄. **H₀: mean Δ = 0** vs **H₁: mean Δ ≠ 0** (two-sided, α = 0.05; the direction was not assumed in advance).
+
+```{r paired-table}
+paired_tab <- tibble(
+  Test = c("Paired t-test (mean Δ)", "Wilcoxon signed-rank (median Δ)",
+           "Bootstrap BCa (mean Δ)", "Bootstrap percentile (mean Δ)"),
+  Estimate = c(unname(pt$estimate), median(wide$delta), mean(wide$delta), mean(wide$delta)),
+  `95% CI` = c(ci_txt(pt$conf.int[1], pt$conf.int[2]), "–",
+               ci_txt(bdci[1], bdci[2]), ci_txt(bpci[1], bpci[2])),
+  `p-value` = c(fp(pt$p.value), fp(pw$p.value), "–", "–")
+)
+kable(paired_tab, digits = 1, align = "lrrr",
+      caption = "Table 9. Paired comparison of 2023 and 2024 attainment (percentage points).")
+```
+
+```{r slope-plot, fig.height=5.2}
+slope_df <- tidy |>
+  left_join(select(wide, municipality, delta), by = "municipality") |>
+  mutate(direction = ifelse(delta > 0, "Declined", "Improved or flat"))
+ggplot(slope_df, aes(year_f, progress_pct, group = municipality, colour = direction)) +
+  geom_line(alpha = 0.55) + geom_point(size = 1.6, alpha = 0.8) +
+  geom_hline(yintercept = 100, colour = "grey40", linetype = "dashed") +
+  scale_y_log10(breaks = c(10, 25, 50, 100, 200, 400)) +
+  scale_colour_manual(values = c("Declined" = "#C0392B", "Improved or flat" = "#1B9E77"), name = NULL) +
+  labs(title = "Figure 6. Each municipality's attainment, 2023 → 2024",
+       subtitle = "Log scale; dashed line = 100%", x = NULL, y = "Housing progress (% of annual target, log scale)")
+```
+
+**Interpretation.** Attainment fell by `r f1(pt$estimate)` percentage points on average (`r n_down` of 50 municipalities declined). The paired *t*-test gives `r pf(pt$p.value)` and its 95% interval `r ci_txt(pt$conf.int[1], pt$conf.int[2])` just includes 0; the Wilcoxon test gives `r pf(pw$p.value)`. The bootstrap intervals sit right on the boundary (BCa `r ci_txt(bdci[1], bdci[2])`, percentile `r ci_txt(bpci[1], bpci[2])`). At the 5% level the *t*-test and Wilcoxon test therefore **fail to reject H₀**, but the bootstrap and the p-values near 0.07 say the decline is *borderline*, not clearly absent: the evidence is suggestive but not conclusive. The effect size is small (Cohen's d_z = `r sprintf("%.2f", dz)`), and with only 50 municipalities and large between-municipality variation, power to detect a change of this size is limited. Figure 6 shows why: many lines fall but many rise, and individual swings (note the log scale) are often larger than the average shift.
+
+# Regression: does target size predict attainment?
+
+## Choosing the model
+
+Figure 7 plots attainment against the annual target on log–log axes. Larger targets go with lower attainment, and the relationship is close to a straight line on these axes.
+
+```{r scatter, fig.height=4.6}
+sc <- tidy |> filter(year %in% c(2023, 2024))
+lab_pts <- sc |>
+  filter(municipality %in% c("Chatham-Kent", "North Bay", "Toronto", "Mississauga", "Whitchurch-Stouffville")) |>
+  mutate(h = ifelse(municipality %in% c("Toronto", "Mississauga"), 1.1, -0.1))
+ggplot(sc, aes(annual_target, progress_pct)) +
+  geom_hline(yintercept = 100, colour = "#C0392B", linetype = "dashed") +
+  geom_point(colour = "#3C78A8", size = 2.2, alpha = 0.75) +
+  geom_smooth(method = "lm", formula = y ~ x, colour = "#1f3d5c", fill = "grey70", linewidth = 0.9) +
+  geom_text(data = lab_pts, aes(label = municipality, hjust = h), size = 2.9) +
+  scale_x_log10(labels = comma, expand = expansion(mult = c(0.04, 0.2))) +
+  scale_y_log10(breaks = c(10, 25, 50, 100, 200, 400, 800)) +
+  facet_wrap(~ year) +
+  labs(title = "Figure 7. Annual target vs attainment (log–log scale)",
+       subtitle = "Line = log-log regression fit with 95% confidence band; dashed = 100%",
+       x = "Annual housing target (units, log scale)", y = "Housing progress (% of target, log scale)")
+```
+
+I compare three specifications for each year. Attainment is strictly positive and right-skewed, so modelling its logarithm is natural, and a log of the target tames the huge range of target sizes (about 70 to 24,000 units).
+
+```{r model-cmp}
+kable(model_cmp, digits = 3, align = "llrrrrr",
+      caption = "Table 10. Candidate regression models (response on the scale shown; n = 50 per year).")
+```
+
+The straight-line model A (the natural first try) has essentially no explanatory power and a non-significant slope. Model B (semi-log) shows a significant slope, but its **residuals are clearly non-normal** (Shapiro-Wilk p < 0.001 in both years) and it is dominated by one point: Chatham-Kent has a Cook's distance of `r sprintf("%.2f", top_cook_val)` in 2023 (a value above 1 is a conventional warning sign). Model C, **log-log**, has residuals consistent with normality, a slope with a clean interpretation (an elasticity), and, as Section 6 shows, the best out-of-sample accuracy. I therefore use it as the primary model. (R² values are not comparable across models A–B and C because the response is on a different scale; Model B's higher R² partly reflects the influence of a few extreme values.)
+
+```{r diagnostics, fig.width=10, fig.height=3.6, out.width="100%"}
+op <- par(mfrow = c(1, 3), mar = c(4.2, 4.2, 2.6, 1))
+plot(fits[["2023"]]$loglog, which = 1, caption = NULL, main = "Residuals vs fitted", pch = 19, col = "#3C78A8")
+plot(fits[["2023"]]$loglog, which = 2, caption = NULL, main = "Normal Q–Q",          pch = 19, col = "#3C78A8")
+plot(fits[["2023"]]$loglog, which = 4, caption = NULL, main = "Cook's distance",     col = "#3C78A8")
+par(op)
+```
+<p class="caption-note"><b>Figure 8.</b> Diagnostics for the 2023 log-log model. Residuals show no funnel shape (the smoother bends only mildly), points follow the Q–Q line, and no observation has a Cook's distance near 1 (largest: Toronto, then Chatham-Kent).</p>
+
+## Results and interpretation
+
+The fitted model is **log(attainment %) = β₀ + β₁ · log(annual target)**.
+
+```{r loglog-table}
+kable(select(loglog_tab, Year, `Slope (elasticity)`, `95% CI`, `Bootstrap 95% CI`, `p-value`, `R²`,
+             `Doubling the target →`, `Slope excl. Chatham-Kent`, `Slope excl. Toronto`),
+      digits = 3, align = "lrrrrrrrr",
+      caption = "Table 11. Log-log regression of attainment on annual target, by year.")
+```
+
+* **Slope.** The 2023 slope is `r sprintf("%.3f", l23$"Slope (elasticity)")` (95% CI `r l23$"95% CI"`; p = `r l23$"p-value"`). Because both variables are logged, it is an *elasticity*: a 1% larger annual target goes with about `r sprintf("%.2f", abs(l23$"Slope (elasticity)"))`% lower attainment. Equivalently, **doubling** a municipality's target multiplies its attainment by 2^`r sprintf("%.3f", l23$"Slope (elasticity)")` ≈ `r sprintf("%.2f", 2^l23$"Slope (elasticity)")`, a **`r sprintf("%.0f", abs(100 * (2^l23$"Slope (elasticity)" - 1)))`% reduction**. For 2024 the slope is `r sprintf("%.3f", l24$"Slope (elasticity)")` (95% CI `r l24$"95% CI"`; p = `r l24$"p-value"`), a `r sprintf("%.0f", abs(100 * (2^l24$"Slope (elasticity)" - 1)))`% reduction per doubling. The two years' intervals overlap heavily, so the strength of the relationship is similar.
+* **Units scale less than proportionally with the target.** Since log(attainment) = log(units) − log(target), the units started scale as target^`r sprintf("%.2f", l23$"Units scale as target^")` in 2023. A municipality with a target 10% larger started only about `r sprintf("%.1f", 100 * (1.1^l23$"Units scale as target^" - 1))`% more homes, which is exactly why larger targets are harder to fill proportionally.
+* **Intercept.** β₀ = `r sprintf("%.2f", coef(fits[["2023"]]$loglog)[1])` is the predicted log-attainment at a target of one unit, an extrapolation far outside the data (smallest annual target: `r f0(min(tidy$annual_target))`), so it carries no practical interpretation.
+* **Fit.** R² = `r sprintf("%.3f", l23$"R²")` in 2023 (`r sprintf("%.3f", loglog_tab$"R²"[2])` in 2024). Target size explains roughly one-fifth of the variation in attainment: a real but far-from-complete explanation.
+* **Robustness.** The bootstrap interval (`r l23$"Bootstrap 95% CI"`) is nearly identical to the classical one, and the slope is stable when single extreme observations are dropped: without Toronto (the highest Cook's distance in this model, `r sprintf("%.2f", max(cooks.distance(fits[["2023"]]$loglog)))`) the 2023 slope is `r sprintf("%.3f", l23$"Slope excl. Toronto")` (`r pf(l23$p_nt)`), and without Chatham-Kent (the highest attainment rate) it is `r sprintf("%.3f", l23$"Slope excl. Chatham-Kent")` (`r pf(l23$p_nk)`). Both remain negative and significant.
+
+<div class="box warn">
+
+**Caveats on the regression.** (1) The target appears in the denominator of the response, so very small targets mechanically produce volatile percentages; part of the pattern is a statistical artefact of ratios, which is why the units-scaling view above is a useful complement. (2) This is an observational association across 50 municipalities, not a causal effect: targets were assigned from population and growth trends, and larger municipalities differ in many other ways (land supply, approvals, market conditions) that are not in the data.
+
+</div>
+
+# Cross-validation
+
+In-sample fit can flatter a model. To estimate **out-of-sample** accuracy, I use **repeated `r CV_K`-fold cross-validation** (`r CV_REP` repetitions with different random fold assignments, equal-sized folds) on the 2023 data, and compare each regression with a **baseline that always predicts the training-set mean**. Errors are measured in attainment percentage points on the original scale (the log-log predictions are back-transformed with Duan's smearing correction). As a stricter test, each model fitted on 2023 is also used to predict 2024, a genuine hold-out year.
+
+```{r cv-table}
+kable(select(cv_tab, Model, `RMSE (mean)`, `RMSE (SD over repeats)`, `MAE (mean)`,
+             `RMSE vs. baseline`, `MAE vs. baseline`, `RMSE (2024 hold-out)`, `MAE (2024 hold-out)`),
+      digits = 1, align = "lrrrrrrr",
+      caption = "Table 12. Cross-validated prediction error (percentage points of attainment). Lower is better.")
+```
+
+```{r cv-plot, fig.height=3.8}
+cv_raw |>
+  mutate(Model = factor(Model, levels = rev(names(cv_models)))) |>
+  ggplot(aes(RMSE, Model)) +
+  geom_vline(xintercept = base_rmse, colour = "#C0392B", linetype = "dashed") +
+  geom_boxplot(fill = "#3C78A8", alpha = 0.4, outlier.size = 1) +
+  labs(title = "Figure 9. Cross-validated RMSE across 50 repetitions of 5-fold CV",
+       subtitle = "Dashed line = mean RMSE of the intercept-only baseline", x = "RMSE (percentage points)", y = NULL)
+```
+
+**Interpretation.** The log-log model (C) has the lowest error: a cross-validated RMSE of `r f1(cv_C$"RMSE (mean)")` points versus `r f1(base_rmse)` for the baseline (`r cv_C$"RMSE vs. baseline"`), and a mean absolute error `r sub("^[+-]", "", cv_C$"MAE vs. baseline")` lower. It also wins on the 2024 hold-out (RMSE `r f1(cv_C$"RMSE (2024 hold-out)")` vs `r f1(cv_0$"RMSE (2024 hold-out)")` for the baseline), showing the pattern carries over to a new year. The raw linear model (A) is *worse* than the baseline in repeated CV (`r cv_A$"RMSE vs. baseline"`) and only marginally better on the 2024 hold-out (`r f1(cv_A$"RMSE (2024 hold-out)")` vs `r f1(cv_0$"RMSE (2024 hold-out)")`): it chases outliers, a weakness its in-sample output hides. The gains are real but moderate: a typical prediction error of roughly `r f0(cv_C$"RMSE (mean)")` points is still large next to the data's scale (SD ≈ `r f0(d23$SD)`), consistent with an R² near 0.2.
+
+# Conclusions
+
+**Answering the research questions**
+
+1. **Are targets being met?** Mostly not. In 2023, `r n_status(2023, "Exceeded")` of 50 municipalities exceeded their annual target, `r n_status(2023, "On track")` were on track and `r n_status(2023, "Not met")` were below 80%; in 2024 these became `r n_status(2024, "Exceeded")`, `r n_status(2024, "On track")` and `r n_status(2024, "Not met")`. In aggregate, the 50 municipalities reached `r f1(p23$pct_50)`% of their 2023 target and `r f1(p24$pct_50)`% of their 2024 target.
+2. **What is the average attainment, and does it differ from 100%?** The mean is `r f1(d23$Mean)`% (2023) and `r f1(d24$Mean)`% (2024), but neither is statistically different from 100% (`r pf(i23$"t-test p")` and `r fp(i24$"t-test p")`); the mean is inflated by a few small municipalities, and the median municipality sits at `r f0(d23$Median)`% and `r f0(d24$Median)`%. The 2023→2024 decline of about `r f1(pt$estimate)` points is borderline (paired t-test `r pf(pt$p.value)`; the bootstrap interval just excludes zero).
+3. **Is target size related to attainment?** Yes: larger targets are associated with significantly lower attainment (log-log slope `r sprintf("%.2f", l23$"Slope (elasticity)")` in 2023, `r sprintf("%.2f", l24$"Slope (elasticity)")` in 2024). Doubling a target goes with roughly a `r sprintf("%.0f", abs(100 * (2^l23$"Slope (elasticity)" - 1)))`% lower attainment rate, and cross-validation shows the relationship improves prediction out of sample.
+
+**The takeaway:** the municipalities carrying the largest absolute targets, which matter most for the 1.5-million-home goal, are the ones least likely to meet them in proportion.
+
+**Limitations.** Only 50 municipalities and two years of data, so tests have limited power; the 2024 definition of "progress" is broader than 2023's; the data count starts and not completions; annual targets ramp up; and the regression is associational. Natural extensions are adding 2025 data when available, modelling units started directly with a count model (e.g. Poisson / negative binomial with log-target offset), and adding controls such as population growth.
+
+# Appendix: Reproducibility {-}
+
+All numbers, tables and figures in this report are generated by the code below; data are bundled in `data/` and loaded by `R/load_data.R`. Random seed: 57.
+
+```{r session-info, echo=TRUE}
+sessionInfo()
+```
+
+# Appendix: Full source code {-}
+
+```{r appendix-code, ref.label = setdiff(knitr::all_labels(), c("appendix-code", "session-info")), echo = TRUE, eval = FALSE}
+```
